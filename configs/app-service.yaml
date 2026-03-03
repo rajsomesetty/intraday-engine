@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: intraday-engine
+  namespace: intraday
+spec:
+  type: NodePort
+  selector:
+    app: intraday-engine
+  ports:
+    - port: 8000
+      targetPort: 8000
+      nodePort: 30007

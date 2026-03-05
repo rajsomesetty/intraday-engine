@@ -33,6 +33,8 @@ from app.api import backtest_routes
 from app.services.strategy_engine import register_strategy
 from app.strategies.moving_average_cross import MovingAverageCross
 from app.api import strategy_analytics_routes
+from app.api import strategy_status_routes
+from app.database import SessionLocal
 
 from app.services.metrics_service import (
     current_equity,
@@ -150,8 +152,15 @@ async def lifespan(app: FastAPI):
     print("🚀 Intraday Engine starting up")
 
     # Register trading strategies
-    register_strategy(MovingAverageCross("RELIANCE", account_id=1))
-    register_strategy(MovingAverageCross("TCS", account_id=2))
+    db = SessionLocal()
+
+    register_strategy(
+        MovingAverageCross(
+            symbol="RELIANCE",
+            account_id=1,
+            db=db
+        )
+    )
 
     # Daily reset
     scheduler.add_job(
@@ -223,6 +232,7 @@ app.include_router(risk_routes.router)
 app.include_router(analytics_routes.router)
 app.include_router(backtest_routes.router)
 app.include_router(strategy_analytics_routes.router)
+app.include_router(strategy_status_routes.router)
 
 
 # -----------------------------------

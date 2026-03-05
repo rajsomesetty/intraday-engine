@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intraday-redis
+  namespace: intraday
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: intraday-redis
+  template:
+    metadata:
+      labels:
+        app: intraday-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7
+        ports:
+        - containerPort: 6379

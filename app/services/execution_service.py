@@ -1,64 +1,87 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import text
+from decimal import Decimal
+from datetime import datetime
 
 from app.models.trade import Trade
 from app.models.position import Position
-from app.services.risk_service import enforce_risk, RiskException
 from app.models.account import Account
+from app.models.trade_audit import TradeAudit
+
+from app.services.risk_service import enforce_risk, RiskException
+from app.services.market_data_service import market_data_service
+from app.services.rate_limit_service import enforce_rate_limit
+
+from app.services.metrics_service import (
+    total_trades,
+    total_rejections,
+)
 
 
 def execute_trade(
     db: Session,
+    account_id: int,
     symbol: str,
     quantity: int,
     price: float,
     side: str,
     idempotency_key: str,
-):
+    strategy_name: str = None,
+):    
 
     try:
+
         # --------------------------------
         # 1️⃣ Idempotency Check
         # --------------------------------
         existing = (
             db.query(Trade)
-            .filter(Trade.order_idempotency_key == idempotency_key)
+            .filter(
+                Trade.order_idempotency_key == idempotency_key,
+                Trade.account_id == account_id,
+            )
             .first()
         )
+
         if existing:
             return existing
 
-        trade_value = quantity * price
+        # --------------------------------
+        # 2️⃣ Global Rate Limit Protection
+        # --------------------------------
+        enforce_rate_limit(db, account_id)
+
+        trade_value = Decimal(quantity) * Decimal(str(price))
 
         # --------------------------------
-        # 2️⃣ Lock Account Row
+        # 3️⃣ Lock Account Row
         # --------------------------------
         account = (
             db.query(Account)
-            .filter(Account.id == 1)
+            .filter(Account.id == account_id)
             .with_for_update()
             .first()
         )
-
-if not account:
-    raise Exception("Account not initialized")
 
         if not account:
             raise Exception("Account not initialized")
 
         # --------------------------------
-        # 3️⃣ Lock Position Row
+        # 4️⃣ Lock Position Row
         # --------------------------------
         position = (
             db.query(Position)
-            .filter(Position.symbol == symbol)
+            .filter(
+                Position.account_id == account_id,
+                Position.symbol == symbol,
+            )
             .with_for_update()
             .first()
         )
 
         if not position:
             position = Position(
+                account_id=account_id,
                 symbol=symbol,
                 quantity=0,
                 average_price=0.0,
@@ -67,10 +90,11 @@ if not account:
             db.flush()
 
         # --------------------------------
-        # 4️⃣ SIMULATE POST-TRADE STATE
+        # 5️⃣ Simulate Post-Trade State
         # --------------------------------
         simulated_qty = position.quantity
         simulated_avg = position.average_price
+        realized_pnl = Decimal("0")
 
         if side == "BUY":
 
@@ -80,9 +104,9 @@ if not account:
                 simulated_avg = 0
             else:
                 simulated_avg = (
-                    (simulated_qty * simulated_avg)
-                    + (quantity * price)
-                ) / new_total_qty
+                    (Decimal(simulated_qty) * Decimal(str(simulated_avg)))
+                    + (Decimal(quantity) * Decimal(str(price)))
+                ) / Decimal(new_total_qty)
 
             simulated_qty = new_total_qty
 
@@ -91,96 +115,162 @@ if not account:
             if quantity > simulated_qty:
                 raise RiskException("Cannot sell more than held quantity")
 
+            price_decimal = Decimal(str(price))
+            old_avg = Decimal(str(position.average_price))
+            qty_decimal = Decimal(quantity)
+
+            realized_pnl = (price_decimal - old_avg) * qty_decimal
             simulated_qty -= quantity
 
         else:
             raise Exception("Invalid side. Must be BUY or SELL")
 
         # --------------------------------
-        # 5️⃣ Build Simulated Portfolio
+        # 6️⃣ Build Simulated Portfolio
         # --------------------------------
-        all_positions = db.query(Position).all()
-
         simulated_positions = []
 
-        for pos in all_positions:
-            if pos.symbol == symbol:
-                simulated_positions.append({
-                    "symbol": symbol,
-                    "quantity": simulated_qty,
-                    "average_price": simulated_avg,
-                })
-            else:
-                simulated_positions.append({
-                    "symbol": pos.symbol,
-                    "quantity": pos.quantity,
-                    "average_price": pos.average_price,
-                })
+        other_positions = (
+            db.query(Position)
+            .filter(
+                Position.account_id == account_id,
+                Position.symbol != symbol,
+            )
+            .all()
+        )
 
-        # If new symbol not previously present
-        if not any(p["symbol"] == symbol for p in simulated_positions):
+        for pos in other_positions:
             simulated_positions.append({
-                "symbol": symbol,
-                "quantity": simulated_qty,
-                "average_price": simulated_avg,
+                "symbol": pos.symbol,
+                "quantity": pos.quantity,
+                "average_price": pos.average_price,
             })
 
+        simulated_positions.append({
+            "symbol": symbol,
+            "quantity": simulated_qty,
+            "average_price": simulated_avg,
+        })
+
         # --------------------------------
-        # 6️⃣ Enforce Risk on Simulated State
+        # 7️⃣ Update Market Data
         # --------------------------------
-        enforce_risk(
+        market_data_service.update_price(symbol, price)
+        ltp_map = market_data_service.get_all_prices()
+
+        # --------------------------------
+        # 8️⃣ Simulate Daily PnL
+        # --------------------------------
+        simulated_daily_pnl = account.daily_pnl
+
+        if side == "SELL":
+            simulated_daily_pnl += realized_pnl
+
+        # --------------------------------
+        # 9️⃣ Enforce Risk Engine
+        # --------------------------------
+        simulation_result = enforce_risk(
             account=account,
             simulated_positions=simulated_positions,
             trade_value=trade_value,
-            ltp=price,
+            ltp_map=ltp_map,
+            simulated_daily_pnl=simulated_daily_pnl,
         )
 
         # --------------------------------
-        # 7️⃣ Apply Mutation After Risk Passes
+        # 🔟 Insert PASSED Audit
+        # --------------------------------
+        audit = TradeAudit(
+            account_id=account_id,
+            symbol=symbol,
+            quantity=quantity,
+            price=price,
+            side=side,
+            simulated_equity=simulation_result["equity"],
+            simulated_drawdown=simulation_result["drawdown"],
+            simulated_total_pnl=simulation_result["total_pnl"],
+            status="PASSED",
+        )
+        db.add(audit)
+
+        # --------------------------------
+        # 11️⃣ Apply Position Mutation
         # --------------------------------
         position.quantity = simulated_qty
         position.average_price = simulated_avg
 
         if side == "SELL":
-            realized_pnl = (price - position.average_price) * quantity
-
-            db.execute(
-                text(
-                    "UPDATE account SET daily_pnl = daily_pnl + :pnl WHERE id=1"
-                ),
-                {"pnl": realized_pnl},
-            )
+            account.daily_pnl += realized_pnl
 
         # --------------------------------
-        # 8️⃣ Insert Trade
+        # 12️⃣ Insert Trade
         # --------------------------------
         trade = Trade(
+            account_id=account_id,
             order_idempotency_key=idempotency_key,
             symbol=symbol,
             quantity=quantity,
             entry_price=price,
             status=f"{side}_EXECUTED",
+            strategy_name=strategy_name,
         )
 
         db.add(trade)
 
+        total_trades.inc()
+
         # --------------------------------
-        # 9️⃣ Commit
+        # 13️⃣ Commit
         # --------------------------------
         db.commit()
         db.refresh(trade)
 
         return trade
 
-    except RiskException:
+    except RiskException as e:
+
         db.rollback()
-        raise
+
+        account = (
+            db.query(Account)
+            .filter(Account.id == account_id)
+            .with_for_update()
+            .first()
+        )
+
+        account.is_trading_enabled = False
+        account.breach_count = (account.breach_count or 0) + 1
+        account.last_breach_reason = str(e)
+        account.last_breach_time = datetime.utcnow()
+
+        audit = TradeAudit(
+            account_id=account_id,
+            symbol=symbol,
+            quantity=quantity,
+            price=price,
+            side=side,
+            status="REJECTED",
+            rejection_reason=str(e),
+        )
+
+        db.add(audit)
+
+        total_rejections.inc()
+
+        db.commit()
+
+        raise e
 
     except IntegrityError:
+
         db.rollback()
+
         return (
             db.query(Trade)
-            .filter(Trade.order_idempotency_key == idempotency_key)
+            .filter(
+                Trade.order_idempotency_key == idempotency_key,
+                Trade.account_id == account_id,
+            )
             .first()
         )
 

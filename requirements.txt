@@ -7,3 +7,5 @@ python-dotenv
 pydantic-settings
 kiteconnect
 apscheduler
+prometheus-client
+redis==5.0.1

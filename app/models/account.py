@@ -1,5 +1,5 @@
-from sqlalchemy import Column, Integer, Numeric, Boolean
-from app.db.base import Base  # adjust if your Base import differs
+from sqlalchemy import Column, Integer, Numeric, Boolean, Text, DateTime
+from app.models.base import Base
 
 
 class Account(Base):
@@ -15,3 +15,7 @@ class Account(Base):
     intraday_peak_equity = Column(Numeric, nullable=False, default=50000)
     current_equity = Column(Numeric, nullable=False, default=50000)
     is_trading_enabled = Column(Boolean, nullable=False, default=True)
+
+    breach_count = Column(Integer, default=0)
+    last_breach_reason = Column(Text, nullable=True)
+    last_breach_time = Column(DateTime, nullable=True)

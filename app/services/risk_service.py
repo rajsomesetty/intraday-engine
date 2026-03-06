@@ -38,23 +38,76 @@ def enforce_risk(
         )
 
     if not account.is_trading_enabled:
-        raise RiskException("Trading disabled due to prior risk breach")
+        raise RiskException(
+            "Trading disabled due to prior risk breach"
+        )
 
     # ------------------------------
-    # Exposure
+    # Exposure Calculation
     # ------------------------------
+
     exposure = Decimal("0")
 
     for pos in simulated_positions:
+
         qty = Decimal(pos["quantity"])
-        avg = Decimal(str(pos["average_price"]))
-        exposure += qty * avg
+        entry = Decimal(str(pos["entry_price"]))
+
+        exposure += qty * entry
 
     exposure_after_trade = exposure + Decimal(trade_value)
 
     # ------------------------------
+    # Max Allocation Rule
+    # ------------------------------
+
+    max_allocation = (
+        Decimal(account.total_capital)
+        * Decimal(risk_config.max_allocation_pct)
+        / Decimal("100")
+    )
+
+    if Decimal(trade_value) > max_allocation:
+
+        raise RiskException(
+            "Trade exceeds max allocation rule"
+        )
+
+    # ------------------------------
+    # Max Exposure Rule
+    # ------------------------------
+
+    max_exposure = (
+        Decimal(account.total_capital)
+        * Decimal(risk_config.max_exposure_pct)
+        / Decimal("100")
+    )
+
+    if exposure_after_trade > max_exposure:
+
+        raise RiskException(
+            "Max exposure limit breached"
+        )
+
+    # ------------------------------
+    # Max Open Positions Rule
+    # ------------------------------
+
+    open_positions = [
+        pos for pos in simulated_positions
+        if Decimal(pos["quantity"]) > 0
+    ]
+
+    if len(open_positions) > risk_config.max_open_positions:
+
+        raise RiskException(
+            "Max open positions reached"
+        )
+
+    # ------------------------------
     # Portfolio Heat Check
     # ------------------------------
+
     new_trade_risk = Decimal("0")
 
     last_pos = simulated_positions[-1]
@@ -62,24 +115,30 @@ def enforce_risk(
     if last_pos.get("stop_loss"):
 
         risk_per_share = abs(
-            Decimal(str(last_pos["average_price"]))
+            Decimal(str(last_pos["entry_price"]))
             - Decimal(str(last_pos["stop_loss"]))
         )
 
-        new_trade_risk = risk_per_share * Decimal(last_pos["quantity"])
+        new_trade_risk = risk_per_share * abs(
+            Decimal(last_pos["quantity"])
+        )
 
         allowed = check_portfolio_heat(
             session,
             account.id,
-            new_trade_risk,
+            new_trade_risk
         )
 
         if not allowed:
-            raise RiskException("Portfolio heat exceeded")
+
+            raise RiskException(
+                "Portfolio heat exceeded"
+            )
 
     # ------------------------------
-    # Unrealized MTM
+    # Unrealized MTM Calculation
     # ------------------------------
+
     unrealized = Decimal("0")
 
     for pos in simulated_positions:
@@ -89,34 +148,76 @@ def enforce_risk(
         if qty <= 0:
             continue
 
-        avg_price = Decimal(str(pos["average_price"]))
+        entry_price = Decimal(str(pos["entry_price"]))
         ltp_value = ltp_map.get(pos["symbol"])
 
         if ltp_value is None:
-            symbol_ltp = avg_price
+            symbol_ltp = entry_price
         else:
             symbol_ltp = Decimal(str(ltp_value))
 
-        unrealized += (symbol_ltp - avg_price) * qty
+        unrealized += (
+            (symbol_ltp - entry_price) * qty
+        )
+
+    # ------------------------------
+    # Total PnL
+    # ------------------------------
 
     total_pnl = Decimal(simulated_daily_pnl) + unrealized
 
-    account.current_equity = account.total_capital + total_pnl
+    # ------------------------------
+    # Update Equity
+    # ------------------------------
+
+    account.current_equity = (
+        Decimal(account.total_capital) + total_pnl
+    )
 
     if account.current_equity > account.intraday_peak_equity:
+
         account.intraday_peak_equity = account.current_equity
 
-    drawdown = account.intraday_peak_equity - account.current_equity
+    drawdown = (
+        account.intraday_peak_equity
+        - account.current_equity
+    )
 
     daily_loss_limit = Decimal(risk_config.daily_loss_limit)
 
+    # ------------------------------
+    # Intraday Drawdown Protection
+    # ------------------------------
+
     if drawdown >= daily_loss_limit:
-        trigger_kill_switch(account, "Intraday drawdown breached")
-        raise RiskException("Intraday drawdown breached")
+
+        trigger_kill_switch(
+            account,
+            "Intraday drawdown breached"
+        )
+
+        raise RiskException(
+            "Intraday drawdown breached"
+        )
+
+    # ------------------------------
+    # Hard Daily Stop
+    # ------------------------------
 
     if total_pnl <= -daily_loss_limit:
-        trigger_kill_switch(account, "Daily loss limit breached")
-        raise RiskException("Daily loss breached")
+
+        trigger_kill_switch(
+            account,
+            "Daily loss limit breached"
+        )
+
+        raise RiskException(
+            "Daily loss breached"
+        )
+
+    # ------------------------------
+    # Return Simulation Metrics
+    # ------------------------------
 
     return {
         "equity": account.current_equity,

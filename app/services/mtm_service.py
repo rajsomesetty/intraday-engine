@@ -6,7 +6,35 @@ from app.models.account import Account
 from app.models.position import Position
 from app.services.price_feed import get_ltp
 from app.services.risk_service import trigger_kill_switch
+from app.services.market_data_service import market_data_service
 
+def update_mtm_for_symbol(db: Session, symbol: str):
+
+    positions = (
+        db.query(Position)
+        .filter(
+            Position.symbol == symbol,
+            Position.quantity > 0
+        )
+        .all()
+    )
+
+    ltp = market_data_service.get_price(symbol)
+
+    if ltp is None:
+        return
+
+    ltp = Decimal(str(ltp))
+
+    for pos in positions:
+
+        entry = Decimal(str(pos.entry_price))
+        qty = Decimal(pos.quantity)
+
+        unrealized = (ltp - entry) * qty
+
+        # optional: store unrealized if you track it
+        # pos.unrealized_pnl = unrealized
 
 def run_mtm_cycle(db: Session):
 
@@ -33,7 +61,7 @@ def run_mtm_cycle(db: Session):
             ltp = get_ltp(pos.symbol)
 
             unrealized += (
-                (Decimal(ltp) - Decimal(pos.average_price))
+                (Decimal(ltp) - Decimal(pos.entry_price))
                 * Decimal(pos.quantity)
             )
 

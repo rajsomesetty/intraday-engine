@@ -13,6 +13,9 @@ from app.services.market_data_service import market_data_service
 from app.services.rate_limit_service import enforce_rate_limit
 from app.services.strategy_state_service import update_strategy_pnl, check_drawdown
 from app.services.metrics_service import total_trades, total_rejections
+from app.services.account_lock_service import lock_account
+from app.services.liquidity_service import simulate_liquidity
+from app.services.system_control_service import trading_enabled
 
 
 def execute_trade(
@@ -29,7 +32,17 @@ def execute_trade(
 
     try:
 
-        # 1️⃣ Idempotency
+        # -----------------------------------
+        # GLOBAL TRADING KILL SWITCH
+        # -----------------------------------
+
+        if not trading_enabled():
+            raise RiskException("Global trading disabled")
+
+        # -----------------------------------
+        # Idempotency
+        # -----------------------------------
+
         existing = (
             db.query(Trade)
             .filter(
@@ -42,23 +55,27 @@ def execute_trade(
         if existing:
             return existing
 
-        # 2️⃣ Rate limit
         enforce_rate_limit(db, account_id)
+
+        # -----------------------------------
+        # Liquidity simulation
+        # -----------------------------------
+
+        price = simulate_liquidity(price, quantity, side)
 
         trade_value = Decimal(quantity) * Decimal(str(price))
 
-        # 3️⃣ Lock account
+        lock_account(db, account_id)
+
         account = (
             db.query(Account)
             .filter(Account.id == account_id)
-            .with_for_update()
             .first()
         )
 
         if not account:
             raise Exception("Account not initialized")
 
-        # 4️⃣ Lock position
         position = (
             db.query(Position)
             .filter(
@@ -70,49 +87,60 @@ def execute_trade(
         )
 
         if not position:
+
             position = Position(
                 account_id=account_id,
                 symbol=symbol,
                 quantity=0,
-                average_price=0.0,
+                entry_price=0.0,
                 stop_loss=stop_loss,
+                highest_price=None,
+                trailing_distance=None,
             )
+
             db.add(position)
             db.flush()
 
         simulated_qty = position.quantity
-        simulated_avg = position.average_price
+        simulated_avg = position.entry_price
         realized_pnl = Decimal("0")
 
-        # 5️⃣ Simulate trade
+        price_decimal = Decimal(str(price))
+
         if side == "BUY":
 
             new_total_qty = simulated_qty + quantity
 
             simulated_avg = (
                 (Decimal(simulated_qty) * Decimal(str(simulated_avg)))
-                + (Decimal(quantity) * Decimal(str(price)))
+                + (Decimal(quantity) * price_decimal)
             ) / Decimal(new_total_qty)
 
             simulated_qty = new_total_qty
+
+            if stop_loss is not None:
+
+                stop_decimal = Decimal(str(stop_loss))
+                trailing_distance = price_decimal - stop_decimal
+
+                if trailing_distance > 0:
+                    position.trailing_distance = trailing_distance
+                    position.highest_price = price_decimal
 
         elif side == "SELL":
 
             if quantity > simulated_qty:
                 raise RiskException("Cannot sell more than held quantity")
 
-            price_decimal = Decimal(str(price))
-            old_avg = Decimal(str(position.average_price))
+            old_avg = Decimal(str(position.entry_price))
             qty_decimal = Decimal(quantity)
 
             realized_pnl = (price_decimal - old_avg) * qty_decimal
-
             simulated_qty -= quantity
 
         else:
             raise Exception("Invalid side")
 
-        # 6️⃣ Build simulated portfolio
         simulated_positions = []
 
         other_positions = (
@@ -128,28 +156,25 @@ def execute_trade(
             simulated_positions.append({
                 "symbol": pos.symbol,
                 "quantity": pos.quantity,
-                "average_price": pos.average_price,
+                "entry_price": pos.entry_price,
                 "stop_loss": pos.stop_loss,
             })
 
         simulated_positions.append({
             "symbol": symbol,
             "quantity": simulated_qty,
-            "average_price": simulated_avg,
+            "entry_price": simulated_avg,
             "stop_loss": stop_loss,
         })
 
-        # 7️⃣ Update market data
         market_data_service.update_price(symbol, price)
         ltp_map = market_data_service.get_all_prices()
 
-        # 8️⃣ Simulate daily pnl
         simulated_daily_pnl = account.daily_pnl
 
         if side == "SELL":
             simulated_daily_pnl += realized_pnl
 
-        # 9️⃣ Risk engine
         simulation_result = enforce_risk(
             account=account,
             simulated_positions=simulated_positions,
@@ -158,7 +183,6 @@ def execute_trade(
             simulated_daily_pnl=simulated_daily_pnl,
         )
 
-        # 🔟 Audit PASSED
         audit = TradeAudit(
             account_id=account_id,
             symbol=symbol,
@@ -173,26 +197,22 @@ def execute_trade(
 
         db.add(audit)
 
-        # 11️⃣ Apply position mutation
         position.quantity = simulated_qty
-        position.average_price = simulated_avg
+        position.entry_price = simulated_avg
 
-        if stop_loss:
+        if stop_loss is not None:
             position.stop_loss = stop_loss
 
         if side == "SELL":
             account.daily_pnl += realized_pnl
 
-        # 12️⃣ Strategy performance
         if strategy_name and side == "SELL":
 
             pnl_value = float(realized_pnl)
 
             update_strategy_pnl(strategy_name, pnl_value)
-
             check_drawdown(strategy_name)
 
-        # 13️⃣ Insert trade
         trade = Trade(
             account_id=account_id,
             order_idempotency_key=idempotency_key,
@@ -207,7 +227,6 @@ def execute_trade(
 
         total_trades.inc()
 
-        # 14️⃣ Commit
         db.commit()
         db.refresh(trade)
 
@@ -224,10 +243,12 @@ def execute_trade(
             .first()
         )
 
-        account.is_trading_enabled = False
-        account.breach_count = (account.breach_count or 0) + 1
-        account.last_breach_reason = str(e)
-        account.last_breach_time = datetime.utcnow()
+        if account:
+
+            account.is_trading_enabled = False
+            account.breach_count = (account.breach_count or 0) + 1
+            account.last_breach_reason = str(e)
+            account.last_breach_time = datetime.utcnow()
 
         audit = TradeAudit(
             account_id=account_id,
@@ -261,5 +282,6 @@ def execute_trade(
         )
 
     except Exception:
+
         db.rollback()
         raise

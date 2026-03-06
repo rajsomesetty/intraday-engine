@@ -26,7 +26,7 @@ def update_position(
         position = Position(
             symbol=symbol,
             quantity=0,
-            average_price=0.0,
+            entry_price=0.0,
         )
         db.add(position)
         db.flush()  # ensure ID assigned before update
@@ -34,10 +34,10 @@ def update_position(
     new_total_qty = position.quantity + quantity
 
     if new_total_qty == 0:
-        position.average_price = 0.0
+        position.entry_price = 0.0
     else:
-        position.average_price = (
-            (position.quantity * position.average_price)
+        position.entry_price = (
+            (position.quantity * position.entry_price)
             + (quantity * price)
         ) / new_total_qty
 

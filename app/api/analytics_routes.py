@@ -26,7 +26,7 @@ def positions(account_id: int, db: Session = Depends(get_db)):
         {
             "symbol": p.symbol,
             "quantity": p.quantity,
-            "average_price": float(p.average_price)
+            "entry_price": float(p.entry_price)
         }
         for p in positions
     ]

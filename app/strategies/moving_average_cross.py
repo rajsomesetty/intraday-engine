@@ -8,11 +8,9 @@ from app.services.position_sizing_service import calculate_position_size
 
 class MovingAverageCross(BaseStrategy):
 
-    def __init__(self, symbol, account_id, db):
+    def __init__(self, symbol, account_id):
 
         super().__init__(symbol, account_id)
-
-        self.db = db
 
         self.short_window = deque(maxlen=2)
         self.long_window = deque(maxlen=4)
@@ -41,7 +39,6 @@ class MovingAverageCross(BaseStrategy):
             stop_loss = price * Decimal("0.98")
 
             qty = calculate_position_size(
-                db=self.db,
                 account_id=self.account_id,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
@@ -51,13 +48,11 @@ class MovingAverageCross(BaseStrategy):
             if qty > 0:
 
                 submit_order(
-                    db=self.db,
                     account_id=self.account_id,
                     symbol=self.symbol,
                     side="BUY",
                     quantity=qty,
                     price=float(price),
-                    stop_loss=float(stop_loss),
                     strategy_name="MovingAverageCross",
                 )
 
@@ -67,7 +62,6 @@ class MovingAverageCross(BaseStrategy):
             print("Strategy SELL signal")
 
             submit_order(
-                db=self.db,
                 account_id=self.account_id,
                 symbol=self.symbol,
                 side="SELL",

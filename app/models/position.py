@@ -16,3 +16,6 @@ class Position(Base):
     stop_loss = Column(Numeric, nullable=True)
 
     account_id = Column(Integer)
+
+    highest_price = Column(Numeric, nullable=True)
+    trailing_distance = Column(Numeric, nullable=True)

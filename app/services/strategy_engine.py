@@ -1,9 +1,16 @@
+import time
+
 from app.db.session import SessionLocal
 from app.services.execution_service import execute_trade
 from app.services.strategy_state_service import register_strategy_state
 from app.services.strategy_state_service import is_strategy_enabled
+from app.services.execution_model import apply_slippage
 
 strategies = []
+
+# Global strategy trading switch
+strategies_enabled = True
+
 
 def register_strategy(strategy):
 
@@ -11,7 +18,29 @@ def register_strategy(strategy):
 
     register_strategy_state(strategy.__class__.__name__)
 
+
+def disable_all_strategies():
+
+    global strategies_enabled
+
+    strategies_enabled = False
+
+    print("🛑 All strategies disabled due to volatility")
+
+
+def enable_all_strategies():
+
+    global strategies_enabled
+
+    strategies_enabled = True
+
+    print("✅ Strategies re-enabled")
+
+
 def process_tick(symbol, price):
+
+    if not strategies_enabled:
+        return
 
     for strategy in strategies:
 
@@ -30,6 +59,24 @@ def submit_order(account_id, symbol, side, quantity, price, strategy_name):
 
     try:
 
+        # -----------------------------------
+        # Apply slippage model
+        # -----------------------------------
+
+        price = apply_slippage(price, side)
+
+        # -----------------------------------
+        # Generate unique idempotency key
+        # -----------------------------------
+
+        ts = int(time.time() * 1000)
+
+        idempotency_key = f"{strategy_name}_{symbol}_{ts}"
+
+        # -----------------------------------
+        # Execute trade
+        # -----------------------------------
+
         execute_trade(
             db=db,
             account_id=account_id,
@@ -37,7 +84,7 @@ def submit_order(account_id, symbol, side, quantity, price, strategy_name):
             quantity=quantity,
             price=price,
             side=side,
-            idempotency_key=f"{strategy_name}_{symbol}_{price}",
+            idempotency_key=idempotency_key,
             strategy_name=strategy_name
         )
 

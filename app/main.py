@@ -23,18 +23,23 @@ from app.services.rate_limit_service import RateLimitException
 
 from app.services.mtm_service import run_mtm_cycle
 from app.services.price_consumer import start_price_listener
+from app.services.execution_worker import start_execution_worker
+from app.services.strategy_worker import start_strategy_worker
+from app.services.tick_worker import start_tick_worker
 
 from app.schemas.order import OrderRequest
 
 from app.models.account import Account
 from app.models.position import Position
-from app.models.risk_config import RiskConfig
-from app.api import backtest_routes
+
 from app.services.strategy_engine import register_strategy
 from app.strategies.moving_average_cross import MovingAverageCross
+
+from app.api import backtest_routes
 from app.api import strategy_analytics_routes
 from app.api import strategy_status_routes
-from app.database import SessionLocal
+from app.api import risk_routes
+from app.api import analytics_routes
 
 from app.services.metrics_service import (
     current_equity,
@@ -42,19 +47,30 @@ from app.services.metrics_service import (
     kill_switch_state,
 )
 
-from app.api import risk_routes
-from app.api import analytics_routes
-
-
-# -----------------------------------
-# Scheduler Setup
-# -----------------------------------
-
 scheduler = BackgroundScheduler()
+shutdown_event = asyncio.Event()
 
 
 # -----------------------------------
-# Daily Reset Job
+# Worker Auto-Restart Wrapper
+# -----------------------------------
+
+def safe_worker(worker_func, name):
+
+    while True:
+
+        try:
+
+            worker_func()
+
+        except Exception as e:
+
+            print(f"⚠️ {name} crashed:", e)
+            print("🔁 Restarting worker...")
+
+
+# -----------------------------------
+# Daily Reset
 # -----------------------------------
 
 def daily_reset_job():
@@ -63,21 +79,19 @@ def daily_reset_job():
 
     try:
 
-        db.execute(
-            text("""
-                UPDATE account
-                SET daily_pnl = 0,
-                    intraday_peak_equity = current_equity,
-                    is_trading_enabled = TRUE,
-                    breach_count = 0,
-                    last_breach_reason = NULL,
-                    last_breach_time = NULL
-            """)
-        )
+        db.execute(text("""
+            UPDATE account
+            SET daily_pnl = 0,
+                intraday_peak_equity = current_equity,
+                is_trading_enabled = TRUE,
+                breach_count = 0,
+                last_breach_reason = NULL,
+                last_breach_time = NULL
+        """))
 
         db.commit()
 
-        print("🔁 Daily reset executed for all accounts")
+        print("🔁 Daily reset executed")
 
     except Exception as e:
 
@@ -85,6 +99,7 @@ def daily_reset_job():
         print("❌ Daily reset failed:", e)
 
     finally:
+
         db.close()
 
 
@@ -98,12 +113,10 @@ def cleanup_equity_history():
 
     try:
 
-        db.execute(
-            text("""
-                DELETE FROM equity_history
-                WHERE created_at < now() - interval '30 days'
-            """)
-        )
+        db.execute(text("""
+            DELETE FROM equity_history
+            WHERE created_at < now() - interval '30 days'
+        """))
 
         db.commit()
 
@@ -115,6 +128,7 @@ def cleanup_equity_history():
         print("❌ Cleanup failed:", e)
 
     finally:
+
         db.close()
 
 
@@ -140,29 +154,31 @@ def mtm_job():
 
 
 # -----------------------------------
-# Graceful Startup & Shutdown
+# Startup Lifecycle
 # -----------------------------------
-
-shutdown_event = asyncio.Event()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
     print("🚀 Intraday Engine starting up")
 
-    # Register trading strategies
-    db = SessionLocal()
+    # -----------------------------------
+    # Register Strategies
+    # -----------------------------------
 
     register_strategy(
         MovingAverageCross(
             symbol="RELIANCE",
-            account_id=1,
-            db=db
+            account_id=1
         )
     )
 
-    # Daily reset
+    print("📈 Strategy registered: MovingAverageCross RELIANCE")
+
+    # -----------------------------------
+    # Scheduler Jobs
+    # -----------------------------------
+
     scheduler.add_job(
         daily_reset_job,
         trigger="cron",
@@ -172,7 +188,6 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
 
-    # Cleanup old equity history
     scheduler.add_job(
         cleanup_equity_history,
         trigger="cron",
@@ -181,22 +196,80 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
 
-    # MTM worker every 5 seconds
     scheduler.add_job(
         mtm_job,
         trigger="interval",
-        seconds=5,
+        seconds=60,
         id="mtm_worker",
         replace_existing=True
     )
 
-    # Start market price listener
+    # -----------------------------------
+    # Price Listener
+    # -----------------------------------
+
     listener_thread = threading.Thread(
         target=start_price_listener,
         daemon=True
     )
 
     listener_thread.start()
+
+    print("📡 Price listener started")
+
+    # -----------------------------------
+    # Tick Workers
+    # -----------------------------------
+
+    TICK_WORKERS = 2
+
+    for _ in range(TICK_WORKERS):
+
+        t = threading.Thread(
+            target=safe_worker,
+            args=(start_tick_worker, "tick_worker"),
+            daemon=True
+        )
+
+        t.start()
+
+    print(f"📊 {TICK_WORKERS} tick workers started")
+
+    # -----------------------------------
+    # Strategy Workers
+    # -----------------------------------
+
+    STRATEGY_WORKERS = 4
+
+    for _ in range(STRATEGY_WORKERS):
+
+        t = threading.Thread(
+            target=safe_worker,
+            args=(start_strategy_worker, "strategy_worker"),
+            daemon=True
+        )
+
+        t.start()
+
+    print(f"🧠 {STRATEGY_WORKERS} strategy workers started")
+
+    # -----------------------------------
+    # Execution Workers
+    # -----------------------------------
+
+    EXECUTION_WORKERS = 4
+
+    for _ in range(EXECUTION_WORKERS):
+
+        t = threading.Thread(
+            target=safe_worker,
+            args=(start_execution_worker, "execution_worker"),
+            daemon=True
+        )
+
+        t.start()
+
+    print(f"⚙️ {EXECUTION_WORKERS} execution workers started")
 
     scheduler.start()
 
@@ -205,6 +278,7 @@ async def lifespan(app: FastAPI):
     print("🛑 Intraday Engine shutting down...")
 
     shutdown_event.set()
+
     scheduler.shutdown(wait=False)
 
     engine.dispose()
@@ -219,13 +293,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Intraday Equity Trading Engine",
-    version="1.6.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
 
 # -----------------------------------
-# Register Routers
+# Routers
 # -----------------------------------
 
 app.include_router(risk_routes.router)
@@ -236,7 +310,7 @@ app.include_router(strategy_status_routes.router)
 
 
 # -----------------------------------
-# Health Endpoints
+# Health
 # -----------------------------------
 
 @app.get("/health/live")
@@ -262,7 +336,7 @@ def ready(db: Session = Depends(get_db)):
 
 
 # -----------------------------------
-# Risk Status Endpoint
+# Risk Status
 # -----------------------------------
 
 @app.get("/risk/status/{account_id}")
@@ -270,23 +344,17 @@ def risk_status(account_id: int, db: Session = Depends(get_db)):
 
     account = db.query(Account).filter(Account.id == account_id).first()
 
-    risk_config = (
-        db.query(RiskConfig)
-        .filter(RiskConfig.account_id == account_id)
-        .first()
-    )
-
     positions = (
         db.query(Position)
         .filter(Position.account_id == account_id)
         .all()
     )
 
-    if not account or not risk_config:
+    if not account:
 
         raise HTTPException(
             status_code=500,
-            detail="Risk system not initialized"
+            detail="Account not initialized"
         )
 
     exposure = Decimal("0")
@@ -299,9 +367,8 @@ def risk_status(account_id: int, db: Session = Depends(get_db)):
         if qty > 0:
 
             open_positions += 1
-            exposure += qty * Decimal(str(pos.average_price))
+            exposure += qty * Decimal(str(pos.entry_price))
 
-    # Update Prometheus metrics
     current_equity.set(float(account.current_equity))
     current_exposure.set(float(exposure))
     kill_switch_state.set(
@@ -315,22 +382,11 @@ def risk_status(account_id: int, db: Session = Depends(get_db)):
         "exposure": float(exposure),
         "open_positions": open_positions,
         "trading_enabled": account.is_trading_enabled,
-        "risk_limits": {
-            "max_allocation_pct": float(risk_config.max_allocation_pct),
-            "max_exposure_pct": float(risk_config.max_exposure_pct),
-            "daily_loss_limit": float(risk_config.daily_loss_limit),
-            "max_open_positions": risk_config.max_open_positions,
-        },
-        "breach_info": {
-            "breach_count": account.breach_count,
-            "last_breach_reason": account.last_breach_reason,
-            "last_breach_time": account.last_breach_time,
-        }
     }
 
 
 # -----------------------------------
-# Prometheus Metrics Endpoint
+# Prometheus Metrics
 # -----------------------------------
 
 @app.get("/metrics")
@@ -343,14 +399,11 @@ def metrics():
 
 
 # -----------------------------------
-# Order Execution
+# Manual Order
 # -----------------------------------
 
 @app.post("/orders")
-def create_order(
-    order: OrderRequest,
-    db: Session = Depends(get_db),
-):
+def create_order(order: OrderRequest, db: Session = Depends(get_db)):
 
     try:
 
@@ -370,7 +423,6 @@ def create_order(
             "quantity": trade.quantity,
             "price": trade.entry_price,
             "status": trade.status,
-            "idempotency_key": trade.order_idempotency_key,
         }
 
     except RiskException as e:
@@ -385,39 +437,4 @@ def create_order(
         raise HTTPException(
             status_code=429,
             detail=str(e)
-        )
-
-
-# -----------------------------------
-# Admin Manual Reset
-# -----------------------------------
-
-@app.post("/admin/reset-day")
-def reset_day(db: Session = Depends(get_db)):
-
-    try:
-
-        db.execute(
-            text("""
-                UPDATE account
-                SET daily_pnl = 0,
-                    intraday_peak_equity = current_equity,
-                    is_trading_enabled = TRUE,
-                    breach_count = 0,
-                    last_breach_reason = NULL,
-                    last_breach_time = NULL
-            """)
-        )
-
-        db.commit()
-
-        return {"message": "Full intraday reset completed"}
-
-    except Exception:
-
-        db.rollback()
-
-        raise HTTPException(
-            status_code=500,
-            detail="Reset failed"
         )

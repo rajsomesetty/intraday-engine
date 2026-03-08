@@ -5,9 +5,9 @@ import time
 
 from app.db.session import SessionLocal
 from app.services.stop_loss_service import check_stop_losses
-from app.services.mtm_service import update_mtm_for_symbol
 from app.services.volatility_guard import check_volatility
 from app.ml.ml_signal_engine import process_ml_signal
+from app.services.market_data_service import market_data_service
 
 
 REDIS_HOST = os.getenv("REDIS_HOST", "intraday-redis")
@@ -59,16 +59,16 @@ def start_tick_worker():
                 price = tick["price"]
 
                 # -----------------------------------
+                # Update Market Price Cache
+                # -----------------------------------
+
+                market_data_service.update_price(symbol, price)
+
+                # -----------------------------------
                 # Flash Crash Protection
                 # -----------------------------------
 
                 check_volatility(symbol, price)
-
-                # -----------------------------------
-                # Update MTM
-                # -----------------------------------
-
-                update_mtm_for_symbol(db, symbol)
 
                 # -----------------------------------
                 # Stop Loss Engine

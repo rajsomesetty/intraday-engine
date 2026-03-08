@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intraday-ui
+  namespace: intraday
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: intraday-ui
+
+  template:
+    metadata:
+      labels:
+        app: intraday-ui
+
+    spec:
+      containers:
+        - name: intraday-ui
+          image: docker.io/rajsomesetty/intraday-ui:1 
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 80

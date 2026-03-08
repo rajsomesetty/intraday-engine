@@ -1,3 +1,6 @@
+import redis
+import os
+import json
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from decimal import Decimal
@@ -16,6 +19,10 @@ from app.services.metrics_service import total_trades, total_rejections
 from app.services.account_lock_service import lock_account
 from app.services.liquidity_service import simulate_liquidity
 from app.services.system_control_service import trading_enabled
+
+REDIS_HOST = os.getenv("REDIS_HOST", "intraday-redis")
+
+redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 
 
 def execute_trade(
@@ -107,6 +114,10 @@ def execute_trade(
 
         price_decimal = Decimal(str(price))
 
+        # -----------------------------------
+        # BUY LOGIC
+        # -----------------------------------
+
         if side == "BUY":
 
             new_total_qty = simulated_qty + quantity
@@ -127,6 +138,10 @@ def execute_trade(
                     position.trailing_distance = trailing_distance
                     position.highest_price = price_decimal
 
+        # -----------------------------------
+        # SELL LOGIC
+        # -----------------------------------
+
         elif side == "SELL":
 
             if quantity > simulated_qty:
@@ -140,6 +155,10 @@ def execute_trade(
 
         else:
             raise Exception("Invalid side")
+
+        # -----------------------------------
+        # Risk Simulation
+        # -----------------------------------
 
         simulated_positions = []
 
@@ -183,6 +202,10 @@ def execute_trade(
             simulated_daily_pnl=simulated_daily_pnl,
         )
 
+        # -----------------------------------
+        # Audit
+        # -----------------------------------
+
         audit = TradeAudit(
             account_id=account_id,
             symbol=symbol,
@@ -196,6 +219,10 @@ def execute_trade(
         )
 
         db.add(audit)
+
+        # -----------------------------------
+        # Apply Position Updates
+        # -----------------------------------
 
         position.quantity = simulated_qty
         position.entry_price = simulated_avg
@@ -213,6 +240,10 @@ def execute_trade(
             update_strategy_pnl(strategy_name, pnl_value)
             check_drawdown(strategy_name)
 
+        # -----------------------------------
+        # Trade Record
+        # -----------------------------------
+
         trade = Trade(
             account_id=account_id,
             order_idempotency_key=idempotency_key,
@@ -229,6 +260,36 @@ def execute_trade(
 
         db.commit()
         db.refresh(trade)
+
+        # -----------------------------------
+        # Publish Trade Event (NEW)
+        # -----------------------------------
+
+        try:
+
+            trade_event = {
+                "id": trade.id,
+                "account_id": trade.account_id,
+                "symbol": trade.symbol,
+                "side": side,
+                "quantity": trade.quantity,
+                "price": float(trade.entry_price),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+            redis_client.publish(
+                "trade_events",
+                json.dumps({
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "price": price,
+                    "side": side,
+                    "time": str(datetime.utcnow())
+                })
+            )
+
+        except Exception as e:
+            print("⚠️ Failed to publish trade event:", e)
 
         return trade
 

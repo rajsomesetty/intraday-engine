@@ -31,3 +31,13 @@ def enqueue_tick(symbol, price):
     except Exception as e:
 
         print("❌ Tick enqueue failed:", e)
+
+def get_tick_queue_size():
+
+    try:
+
+        return r.llen("tick_queue")
+
+    except Exception:
+
+        return 0

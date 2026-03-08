@@ -243,3 +243,27 @@ def sharpe_ratio(account_id: int, db: Session = Depends(get_db)):
         "account_id": account_id,
         "sharpe_ratio": round(sharpe, 3)
     }
+
+@router.get("/equity/{account_id}")
+def get_equity_history(account_id: int, db: Session = Depends(get_db)):
+
+    rows = db.execute(
+        text("""
+        SELECT
+            equity,
+            created_at
+        FROM equity_history
+        WHERE account_id = :account_id
+        ORDER BY created_at ASC
+        LIMIT 200
+        """),
+        {"account_id": account_id}
+    ).fetchall()
+
+    return [
+        {
+            "equity": float(r.equity),
+            "timestamp": r.created_at.isoformat()
+        }
+        for r in rows
+    ]

@@ -41,6 +41,14 @@ from app.api import strategy_status_routes
 from app.api import risk_routes
 from app.api import analytics_routes
 
+from app.api import trade_routes
+from app.api import position_routes
+from app.api import system_routes
+from app.api import system_status_routes
+from app.api import system_health_routes
+from app.api import ws_routes
+from app.services.market_data_service import market_data_service
+
 from app.services.metrics_service import (
     current_equity,
     current_exposure,
@@ -161,6 +169,11 @@ def mtm_job():
 async def lifespan(app: FastAPI):
 
     print("🚀 Intraday Engine starting up")
+
+    # Initialize market prices
+    market_data_service.update_price("RELIANCE", 500)
+
+    print("📊 Initial price set: RELIANCE = 500")
 
     # -----------------------------------
     # Register Strategies
@@ -307,6 +320,13 @@ app.include_router(analytics_routes.router)
 app.include_router(backtest_routes.router)
 app.include_router(strategy_analytics_routes.router)
 app.include_router(strategy_status_routes.router)
+
+app.include_router(trade_routes.router)
+app.include_router(position_routes.router)
+app.include_router(system_routes.router)
+app.include_router(system_status_routes.router)
+app.include_router(system_health_routes.router)
+app.include_router(ws_routes.router)
 
 
 # -----------------------------------

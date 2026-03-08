@@ -13,3 +13,13 @@ def enqueue_execution(order):
         "execution_queue",
         json.dumps(order)
     )
+
+def get_execution_queue_size():
+
+    try:
+
+        return r.llen("execution_queue")
+
+    except Exception:
+
+        return 0

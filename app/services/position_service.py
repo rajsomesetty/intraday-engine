@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from decimal import Decimal
 from app.models.position import Position
 
 
@@ -8,12 +9,7 @@ def update_position(
     quantity: int,
     price: float,
 ) -> Position:
-    """
-    Atomic position update using row-level locking.
-    Must be called inside an active transaction.
-    """
 
-    # Lock row for this symbol
     position = (
         db.query(Position)
         .filter(Position.symbol == symbol)
@@ -21,25 +17,29 @@ def update_position(
         .first()
     )
 
-    # If position does not exist, create it
     if not position:
+
         position = Position(
             symbol=symbol,
             quantity=0,
-            entry_price=0.0,
+            entry_price=0
         )
+
         db.add(position)
-        db.flush()  # ensure ID assigned before update
+        db.flush()
 
     new_total_qty = position.quantity + quantity
 
+    price_decimal = Decimal(str(price))
+
     if new_total_qty == 0:
-        position.entry_price = 0.0
+        position.entry_price = 0
     else:
+
         position.entry_price = (
-            (position.quantity * position.entry_price)
-            + (quantity * price)
-        ) / new_total_qty
+            (Decimal(position.quantity) * Decimal(str(position.entry_price)))
+            + (Decimal(quantity) * price_decimal)
+        ) / Decimal(new_total_qty)
 
     position.quantity = new_total_qty
 

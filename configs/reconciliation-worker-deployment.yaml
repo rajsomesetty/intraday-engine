@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reconciliation-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reconciliation-worker
+  template:
+    metadata:
+      labels:
+        app: reconciliation-worker
+    spec:
+      containers:
+        - name: reconciliation-worker
+          image: docker.io/rajsomesetty/intraday:v113 
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.services.reconciliation_worker"]
+
+          env:
+            - name: DATABASE_URL
+              value: postgresql://intraday_user:intraday_password_123@intraday-postgres:5432/intraday_engine
+
+            - name: REDIS_URL
+              value: redis://intraday-redis:6379

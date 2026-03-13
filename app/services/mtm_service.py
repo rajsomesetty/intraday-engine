@@ -1,24 +1,19 @@
 from decimal import Decimal
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import logging
 
 from app.models.account import Account
 from app.models.position import Position
 from app.services.market_data_service import market_data_service
 from app.services.risk_service import trigger_kill_switch
 
+logger = logging.getLogger(__name__)
 
 MAX_DRAWDOWN_LIMIT = Decimal("50000")
 
 
 def update_mtm_for_symbol(db: Session, symbol: str):
-    """
-    Compatibility function for tick_worker and market_replay_service.
-
-    MTM is now handled globally by run_mtm_cycle() via scheduler.
-    This function simply ensures the latest market price is present
-    and avoids breaking older modules that import it.
-    """
     return
 
 
@@ -30,54 +25,36 @@ def run_mtm_cycle(db: Session):
 
         positions = (
             db.query(Position)
-            .filter(Position.account_id == account.id)
+            .filter(
+                Position.account_id == account.id,
+                Position.quantity > 0
+            )
             .all()
         )
 
         unrealized = Decimal("0")
 
-        # -----------------------------------
-        # Calculate Unrealized PnL
-        # -----------------------------------
-
         for pos in positions:
 
-            if pos.quantity <= 0:
+            try:
+                ltp = market_data_service.get_price(pos.symbol)
+            except Exception:
                 continue
 
-            ltp = market_data_service.get_price(pos.symbol)
-
-            # Skip symbols with no price
-            if ltp is None:
+            if not ltp:
                 continue
 
             ltp = Decimal(str(ltp))
-
-            if ltp <= 0:
-                continue
-
             entry = Decimal(str(pos.entry_price))
-            qty = Decimal(pos.quantity)
+            qty = Decimal(str(pos.quantity))
 
             unrealized += (ltp - entry) * qty
-
-        # -----------------------------------
-        # Realized PnL already tracked
-        # -----------------------------------
 
         realized = Decimal(str(account.daily_pnl or 0))
 
         total_pnl = realized + unrealized
 
-        # -----------------------------------
-        # Update Equity
-        # -----------------------------------
-
         account.current_equity = account.total_capital + total_pnl
-
-        # -----------------------------------
-        # Update Peak Equity
-        # -----------------------------------
 
         if account.intraday_peak_equity is None:
             account.intraday_peak_equity = account.current_equity
@@ -85,37 +62,24 @@ def run_mtm_cycle(db: Session):
         if account.current_equity > account.intraday_peak_equity:
             account.intraday_peak_equity = account.current_equity
 
-        drawdown = account.intraday_peak_equity - account.current_equity
+        drawdown = (
+            account.intraday_peak_equity - account.current_equity
+        ).quantize(Decimal("0.01"))
 
-        # -----------------------------------
-        # Debug Logs
-        # -----------------------------------
-
-        print(
-            "MTM | account:",
-            account.id,
-            "| equity:",
-            account.current_equity,
-            "| peak:",
-            account.intraday_peak_equity,
-            "| drawdown:",
-            drawdown,
+        logger.info(
+            f"MTM account={account.id} equity={account.current_equity} drawdown={drawdown}"
         )
 
-        # -----------------------------------
-        # Risk Check
-        # -----------------------------------
+        drawdown_limit = Decimal(
+            str(account.max_intraday_drawdown or MAX_DRAWDOWN_LIMIT)
+        )
 
-        if drawdown >= MAX_DRAWDOWN_LIMIT:
+        if drawdown >= drawdown_limit and account.is_trading_enabled:
 
             trigger_kill_switch(
                 account,
                 f"MTM drawdown breach: {drawdown}"
             )
-
-        # -----------------------------------
-        # Store Equity Snapshot
-        # -----------------------------------
 
         db.execute(
             text("""

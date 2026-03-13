@@ -1,6 +1,7 @@
 import redis
 import os
 import json
+import logging
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from decimal import Decimal
@@ -20,9 +21,15 @@ from app.services.account_lock_service import lock_account
 from app.services.liquidity_service import simulate_liquidity
 from app.services.system_control_service import trading_enabled
 
+logger = logging.getLogger(__name__)
+
 REDIS_HOST = os.getenv("REDIS_HOST", "intraday-redis")
 
-redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+redis_client = redis.Redis(
+    host=REDIS_HOST,
+    port=6379,
+    decode_responses=True
+)
 
 
 def execute_trade(
@@ -40,14 +47,14 @@ def execute_trade(
     try:
 
         # -----------------------------------
-        # GLOBAL TRADING KILL SWITCH
+        # Global trading switch
         # -----------------------------------
 
         if not trading_enabled():
             raise RiskException("Global trading disabled")
 
         # -----------------------------------
-        # Idempotency
+        # Idempotency protection
         # -----------------------------------
 
         existing = (
@@ -83,6 +90,10 @@ def execute_trade(
         if not account:
             raise Exception("Account not initialized")
 
+        # -----------------------------------
+        # Load / create position
+        # -----------------------------------
+
         position = (
             db.query(Position)
             .filter(
@@ -99,7 +110,7 @@ def execute_trade(
                 account_id=account_id,
                 symbol=symbol,
                 quantity=0,
-                entry_price=0.0,
+                entry_price=0,
                 stop_loss=stop_loss,
                 highest_price=None,
                 trailing_distance=None,
@@ -115,7 +126,7 @@ def execute_trade(
         price_decimal = Decimal(str(price))
 
         # -----------------------------------
-        # BUY LOGIC
+        # BUY
         # -----------------------------------
 
         if side == "BUY":
@@ -129,17 +140,8 @@ def execute_trade(
 
             simulated_qty = new_total_qty
 
-            if stop_loss is not None:
-
-                stop_decimal = Decimal(str(stop_loss))
-                trailing_distance = price_decimal - stop_decimal
-
-                if trailing_distance > 0:
-                    position.trailing_distance = trailing_distance
-                    position.highest_price = price_decimal
-
         # -----------------------------------
-        # SELL LOGIC
+        # SELL
         # -----------------------------------
 
         elif side == "SELL":
@@ -157,7 +159,7 @@ def execute_trade(
             raise Exception("Invalid side")
 
         # -----------------------------------
-        # Risk Simulation
+        # Risk simulation
         # -----------------------------------
 
         simulated_positions = []
@@ -172,6 +174,7 @@ def execute_trade(
         )
 
         for pos in other_positions:
+
             simulated_positions.append({
                 "symbol": pos.symbol,
                 "quantity": pos.quantity,
@@ -203,7 +206,7 @@ def execute_trade(
         )
 
         # -----------------------------------
-        # Audit
+        # Audit (PASSED)
         # -----------------------------------
 
         audit = TradeAudit(
@@ -221,27 +224,17 @@ def execute_trade(
         db.add(audit)
 
         # -----------------------------------
-        # Apply Position Updates
+        # Apply position updates
         # -----------------------------------
 
         position.quantity = simulated_qty
         position.entry_price = simulated_avg
 
-        if stop_loss is not None:
-            position.stop_loss = stop_loss
-
         if side == "SELL":
             account.daily_pnl += realized_pnl
 
-        if strategy_name and side == "SELL":
-
-            pnl_value = float(realized_pnl)
-
-            update_strategy_pnl(strategy_name, pnl_value)
-            check_drawdown(strategy_name)
-
         # -----------------------------------
-        # Trade Record
+        # Record trade
         # -----------------------------------
 
         trade = Trade(
@@ -262,54 +255,38 @@ def execute_trade(
         db.refresh(trade)
 
         # -----------------------------------
-        # Publish Trade Event (NEW)
+        # Publish trade event
         # -----------------------------------
 
         try:
 
-            trade_event = {
-                "id": trade.id,
+            event = {
+                "type": "trade",
+                "trade_id": trade.id,
                 "account_id": trade.account_id,
                 "symbol": trade.symbol,
                 "side": side,
                 "quantity": trade.quantity,
                 "price": float(trade.entry_price),
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.utcnow().isoformat()
             }
 
-            redis_client.publish(
-                "trade_events",
-                json.dumps({
-                    "symbol": symbol,
-                    "quantity": quantity,
-                    "price": price,
-                    "side": side,
-                    "time": str(datetime.utcnow())
-                })
-            )
+            redis_client.publish("trade_events", json.dumps(event))
 
         except Exception as e:
-            print("⚠️ Failed to publish trade event:", e)
+            logger.error(f"Trade event publish failed: {e}")
 
         return trade
+
+    # -----------------------------------
+    # Risk rejection (DO NOT disable account)
+    # -----------------------------------
 
     except RiskException as e:
 
         db.rollback()
 
-        account = (
-            db.query(Account)
-            .filter(Account.id == account_id)
-            .with_for_update()
-            .first()
-        )
-
-        if account:
-
-            account.is_trading_enabled = False
-            account.breach_count = (account.breach_count or 0) + 1
-            account.last_breach_reason = str(e)
-            account.last_breach_time = datetime.utcnow()
+        logger.warning(f"Trade rejected by risk engine: {e}")
 
         audit = TradeAudit(
             account_id=account_id,
@@ -327,7 +304,7 @@ def execute_trade(
 
         db.commit()
 
-        raise e
+        return None
 
     except IntegrityError:
 
@@ -342,7 +319,8 @@ def execute_trade(
             .first()
         )
 
-    except Exception:
+    except Exception as e:
 
         db.rollback()
+        logger.error(f"Execution error: {e}")
         raise

@@ -1,10 +1,13 @@
 import time
+import logging
 
 from app.db.session import SessionLocal
 from app.services.execution_service import execute_trade
 from app.services.strategy_state_service import register_strategy_state
 from app.services.strategy_state_service import is_strategy_enabled
 from app.services.execution_model import apply_slippage
+
+logger = logging.getLogger(__name__)
 
 strategies = []
 
@@ -18,6 +21,8 @@ def register_strategy(strategy):
 
     register_strategy_state(strategy.__class__.__name__)
 
+    logger.info(f"📈 Strategy registered: {strategy.__class__.__name__} {strategy.symbol}")
+
 
 def disable_all_strategies():
 
@@ -25,7 +30,7 @@ def disable_all_strategies():
 
     strategies_enabled = False
 
-    print("🛑 All strategies disabled due to volatility")
+    logger.warning("🛑 All strategies disabled due to volatility")
 
 
 def enable_all_strategies():
@@ -34,7 +39,7 @@ def enable_all_strategies():
 
     strategies_enabled = True
 
-    print("✅ Strategies re-enabled")
+    logger.info("✅ Strategies re-enabled")
 
 
 def process_tick(symbol, price):
@@ -49,11 +54,28 @@ def process_tick(symbol, price):
         if not is_strategy_enabled(name):
             continue
 
-        if strategy.symbol == symbol:
+        if strategy.symbol != symbol:
+            continue
+
+        try:
+
             strategy.on_tick(price)
+
+        except Exception as e:
+
+            logger.error(f"Strategy error [{name}] {symbol}: {e}")
 
 
 def submit_order(account_id, symbol, side, quantity, price, strategy_name):
+
+    # Basic order validation
+    if quantity <= 0:
+        logger.warning(f"Invalid order quantity for {symbol}")
+        return
+
+    if price <= 0:
+        logger.warning(f"Invalid order price for {symbol}")
+        return
 
     db = SessionLocal()
 
@@ -86,6 +108,18 @@ def submit_order(account_id, symbol, side, quantity, price, strategy_name):
             side=side,
             idempotency_key=idempotency_key,
             strategy_name=strategy_name
+        )
+
+        logger.info(
+            f"Order submitted | strategy={strategy_name} "
+            f"symbol={symbol} side={side} qty={quantity} price={price}"
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Order execution failed | strategy={strategy_name} "
+            f"symbol={symbol} error={e}"
         )
 
     finally:

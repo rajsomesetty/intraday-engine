@@ -1,20 +1,18 @@
-import redis
-import json
-import uuid
-import os
+import asyncio
 
-REDIS_HOST = os.getenv("REDIS_HOST", "intraday-redis")
+class EventBus:
 
-r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+    def __init__(self):
+        self.subscribers = []
+
+    async def publish(self, event):
+        for queue in self.subscribers:
+            await queue.put(event)
+
+    def subscribe(self):
+        queue = asyncio.Queue()
+        self.subscribers.append(queue)
+        return queue
 
 
-def publish_price(symbol, price):
-
-    event = {
-        "event_id": str(uuid.uuid4()),
-        "type": "PRICE_UPDATE",
-        "symbol": symbol,
-        "price": price
-    }
-
-    r.publish("market_prices", json.dumps(event))
+event_bus = EventBus()

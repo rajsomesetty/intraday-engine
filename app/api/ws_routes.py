@@ -1,7 +1,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import redis
 import os
-import asyncio
+import json
 
 router = APIRouter()
 
@@ -24,23 +24,22 @@ async def trade_stream(websocket: WebSocket):
 
     try:
 
-        while True:
+        for message in pubsub.listen():
 
-            message = pubsub.get_message()
+            if message["type"] != "message":
+                continue
 
-            if message and message["type"] == "message":
+            data = json.loads(message["data"])
 
-                await websocket.send_text(message["data"])
-
-            await asyncio.sleep(0.01)
+            await websocket.send_json(data)
 
     except WebSocketDisconnect:
 
-        print("🔌 WebSocket client disconnected")
+        print("WebSocket client disconnected")
 
     except Exception as e:
 
-        print("⚠️ WebSocket error:", e)
+        print("WebSocket error:", e)
 
     finally:
 

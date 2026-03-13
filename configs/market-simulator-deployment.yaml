@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: market-simulator
+  template:
+    metadata:
+      labels:
+        app: market-simulator
+    spec:
+      containers:
+        - name: market-simulator
+          image: docker.io/rajsomesetty/intraday:v116 
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.services.market_simulator_worker"]
+
+          env:
+            - name: REDIS_HOST
+              value: intraday-redis
